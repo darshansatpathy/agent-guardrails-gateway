@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, type-check, test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format
+        run: ruff format --check .
+      - name: Mypy (strict)
+        run: mypy
+      - name: Validate example policy
+        run: aggw validate-policy policies/support-agent.yaml
+      - name: Tests with coverage
+        run: pytest --cov=guardrails_gateway --cov-report=term-missing --cov-fail-under=85
+      - name: Offline demo runs end to end
+        run: aggw demo
+
+  docker:
+    name: Container builds and serves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t agent-guardrails-gateway:ci .
+      - name: Health check
+        run: |
+          docker run -d --name aggw -p 8080:8080 \
+            -e AGGW_GRANT_SECRET=$(openssl rand -hex 32) \
+            -e AGGW_ADMIN_TOKEN=ci-admin \
+            agent-guardrails-gateway:ci
+          for i in $(seq 1 20); do
+            curl -fsS localhost:8080/healthz && exit 0
+            sleep 1
+          done
+          docker logs aggw
+          exit 1
