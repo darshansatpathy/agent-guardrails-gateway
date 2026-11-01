@@ -49,3 +49,9 @@ def test_verify_audit_cli(tmp_path: Path) -> None:
     assert cli.main(["verify-audit", str(path)]) == 0
     path.write_text(path.read_text().replace('"n": 1', '"n": 2'))
     assert cli.main(["verify-audit", str(path)]) == 1
+
+
+def test_eval_cli_writes_report(tmp_path: Path) -> None:
+    out = tmp_path / "report.md"
+    assert cli.main(["eval", "--policy", str(POLICY_PATH), "--markdown", str(out)]) == 0
+    assert "Attacks contained" in out.read_text()

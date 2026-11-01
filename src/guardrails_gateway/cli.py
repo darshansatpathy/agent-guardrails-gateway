@@ -1,4 +1,7 @@
-"""Command-line interface: `aggw serve | demo | verify-audit | validate-policy | mcp-proxy`."""
+"""Command-line interface.
+
+`aggw serve | demo | eval | agent | verify-audit | validate-policy | mcp-proxy`
+"""
 
 from __future__ import annotations
 
@@ -54,6 +57,40 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_eval(args: argparse.Namespace) -> int:
+    from guardrails_gateway.config import DEFAULT_POLICY
+    from guardrails_gateway.evals import DEFAULT_SCENARIOS, run_suite
+
+    report = run_suite(args.policy or DEFAULT_POLICY, args.scenarios or DEFAULT_SCENARIOS)
+    text = report.markdown()
+    print(text)
+    if args.markdown:
+        Path(args.markdown).write_text(text + "\n", encoding="utf-8")
+    return 0 if report.passed else 1
+
+
+def _cmd_agent(args: argparse.Namespace) -> int:
+    from guardrails_gateway.agent import GuardedAgent
+    from guardrails_gateway.config import Settings, build_gateway
+    from guardrails_gateway.providers import OpenAICompatibleProvider
+
+    gateway = build_gateway(Settings.from_env())
+    try:
+        tools = gateway.policy.tools_for(args.agent)
+        grant = gateway.issue_grant(args.agent, args.task, tools, 900, issued_by="aggw-cli")
+        agent = GuardedAgent(
+            gateway, OpenAICompatibleProvider.from_env(), args.agent, args.task, grant
+        )
+        run = agent.run(args.message)
+        for step in run.steps:
+            d = step.decision
+            print(f"{d.outcome.value.upper():<17} {step.tool}  rule={d.rule}  {d.reason}")
+        print("\n" + (run.final_answer or f"(stopped: {run.stopped_reason})"))
+    finally:
+        gateway.close()
+    return 0
+
+
 def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
     from guardrails_gateway.config import Settings, build_gateway
     from guardrails_gateway.mcp_proxy import McpInterceptor, run_proxy
@@ -86,6 +123,18 @@ def main(argv: list[str] | None = None) -> int:
     serve.set_defaults(func=_cmd_serve)
 
     sub.add_parser("demo", help="run the offline walkthrough").set_defaults(func=_cmd_demo)
+
+    ev = sub.add_parser("eval", help="run the attack-scenario evaluation")
+    ev.add_argument("--policy", type=Path)
+    ev.add_argument("--scenarios", type=Path)
+    ev.add_argument("--markdown", type=Path, help="also write the report here")
+    ev.set_defaults(func=_cmd_eval)
+
+    agent = sub.add_parser("agent", help="run an LLM agent whose tool calls go through the gateway")
+    agent.add_argument("message")
+    agent.add_argument("--agent", default="support-agent")
+    agent.add_argument("--task", default="CLI-TASK")
+    agent.set_defaults(func=_cmd_agent)
 
     verify = sub.add_parser("verify-audit", help="check an audit log for tampering")
     verify.add_argument("path", type=Path)
