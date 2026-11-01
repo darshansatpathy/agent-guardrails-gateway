@@ -25,6 +25,7 @@ from guardrails_gateway.approvals import ApprovalStore
 from guardrails_gateway.audit import AuditLog
 from guardrails_gateway.grants import GrantError, GrantIssuer
 from guardrails_gateway.models import Decision, Outcome, ToolCall
+from guardrails_gateway.observability import Timer, log_decision, set_span_attributes, span
 from guardrails_gateway.policy import Policy
 from guardrails_gateway.ratelimit import RateLimiter
 from guardrails_gateway.taint import TaintTracker
@@ -103,24 +104,39 @@ class Gateway:
     # ---------------------------------------------------------------- decisions
 
     def evaluate(self, call: ToolCall, grant_token: str) -> Decision:
-        decision = self._decide(call, grant_token)
+        timer = Timer()
+        attrs = {
+            "aggw.agent_id": call.agent_id,
+            "aggw.task_id": call.task_id,
+            "aggw.session_id": call.session_id,
+            "aggw.tool": call.tool,
+        }
+        with span("aggw.evaluate", attrs) as current:
+            decision = self._decide(call, grant_token)
+            set_span_attributes(
+                current,
+                {
+                    "aggw.outcome": decision.outcome.value,
+                    "aggw.rule": decision.rule,
+                    "aggw.approval_id": decision.approval_id,
+                },
+            )
         self.metrics[f"decision.{decision.outcome.value}"] += 1
         self.metrics[f"rule.{decision.rule}"] += 1
-        self.audit.append(
-            "decision",
-            {
-                "agent_id": call.agent_id,
-                "task_id": call.task_id,
-                "session_id": call.session_id,
-                "tool": call.tool,
-                "arguments": redact(call.arguments),
-                "fingerprint": call.fingerprint(),
-                "outcome": decision.outcome.value,
-                "rule": decision.rule,
-                "reason": decision.reason,
-                "approval_id": decision.approval_id,
-            },
-        )
+        record = {
+            "agent_id": call.agent_id,
+            "task_id": call.task_id,
+            "session_id": call.session_id,
+            "tool": call.tool,
+            "arguments": redact(call.arguments),
+            "fingerprint": call.fingerprint(),
+            "outcome": decision.outcome.value,
+            "rule": decision.rule,
+            "reason": decision.reason,
+            "approval_id": decision.approval_id,
+        }
+        self.audit.append("decision", record)
+        log_decision({**record, "decision_ms": timer.ms})
         return decision
 
     def invoke(self, call: ToolCall, grant_token: str) -> InvokeResult:

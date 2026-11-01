@@ -9,9 +9,12 @@ Two audiences, two credentials:
 from __future__ import annotations
 
 import hmac
+import re
+import uuid
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -21,6 +24,9 @@ from guardrails_gateway.config import Settings, build_gateway
 from guardrails_gateway.gateway import Gateway
 from guardrails_gateway.grants import GrantError
 from guardrails_gateway.models import ToolCall
+from guardrails_gateway.observability import configure_logging, request_id_var
+
+_SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 class GrantRequest(BaseModel):
@@ -46,6 +52,20 @@ def create_app(gateway: Gateway, admin_token: str) -> FastAPI:
         version=__version__,
         description="Policy enforcement point between AI agents and their tools.",
     )
+
+    @app.middleware("http")
+    async def request_id(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        incoming = request.headers.get("x-request-id", "")
+        rid = incoming if _SAFE_REQUEST_ID.fullmatch(incoming) else uuid.uuid4().hex
+        token = request_id_var.set(rid)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_var.reset(token)
+        response.headers["X-Request-ID"] = rid
+        return response
 
     def require_admin(authorization: Annotated[str | None, Header()] = None) -> None:
         expected = f"Bearer {admin_token}"
@@ -124,5 +144,6 @@ def create_app(gateway: Gateway, admin_token: str) -> FastAPI:
 
 def app_from_env() -> FastAPI:
     """Entry point for `uvicorn guardrails_gateway.api:app_from_env --factory`."""
+    configure_logging()
     settings = Settings.from_env()
     return create_app(build_gateway(settings), settings.admin_token)
