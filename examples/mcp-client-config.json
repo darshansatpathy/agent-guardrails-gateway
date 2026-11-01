@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "docs-guarded": {
+      "command": "aggw",
+      "args": [
+        "mcp-proxy",
+        "--agent", "support-agent",
+        "--task", "T-42",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "./docs"
+      ],
+      "env": {
+        "AGGW_GRANT": "<grant issued by your orchestrator for this task>",
+        "AGGW_GRANT_SECRET": "<same secret the gateway uses>",
+        "AGGW_AUDIT_KEY": "<audit chain key>",
+        "AGGW_POLICY": "./policies/support-agent.yaml",
+        "AGGW_DATA_DIR": "./data"
+      }
+    }
+  }
+}
