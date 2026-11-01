@@ -1,0 +1,73 @@
+# Example policy for a customer-support agent.
+#
+# Read it top to bottom:
+#   tools:  what each tool is and how dangerous it is, regardless of who calls it
+#   agents: which tools each agent may use, and the limits on their arguments
+# Anything not listed here is denied.
+
+version: 1
+
+defaults:
+  approval_ttl_seconds: 900      # an unanswered approval request expires after 15 min
+  max_grant_ttl_seconds: 3600    # no task grant may live longer than 1 hour
+
+tools:
+  search_docs:
+    risk: low
+    description: Search the internal knowledge base.
+  read_invoice:
+    risk: low
+    description: Read one invoice by id.
+  web_fetch:
+    risk: low
+    untrusted_output: true       # content from the open web can carry injected instructions
+    description: Fetch a public web page.
+  send_email:
+    risk: medium
+    egress: true                 # moves data outside the organisation
+    description: Send an email to a customer.
+  refund_payment:
+    risk: high                   # money leaves the business: always needs a human
+    description: Refund all or part of an invoice.
+  delete_record:
+    risk: high
+    irreversible: true
+    description: Permanently delete a customer record.
+
+agents:
+  support-agent:
+    description: Answers billing questions and handles small refunds.
+    tools:
+      search_docs:
+        constraints:
+          query: { required: true, max_length: 500 }
+      read_invoice:
+        constraints:
+          invoice_id: { required: true, pattern: "INV-[0-9]{4}" }
+        strict_args: true
+      web_fetch:
+        constraints:
+          url: { required: true, pattern: "https://.+" }
+        rate_limit: { max_calls: 10, per_seconds: 60 }
+      send_email:
+        constraints:
+          to: { required: true, pattern: "[^@\\s]+@example\\.com" }   # customers only
+          subject: { required: true, max_length: 200 }
+          body: { max_length: 5000 }
+        strict_args: true
+        rate_limit: { max_calls: 5, per_seconds: 60 }
+      refund_payment:
+        constraints:
+          invoice_id: { required: true, pattern: "INV-[0-9]{4}" }
+          amount: { required: true, min: 0.01, max: 500 }
+          currency: { required: true, one_of: [USD, EUR, GBP, AED, SAR, INR] }
+        strict_args: true
+      # delete_record is deliberately absent: this agent can never delete anything.
+
+  analytics-agent:
+    description: Read-only reporting. No outbound actions at all.
+    tools:
+      search_docs: {}
+      read_invoice:
+        constraints:
+          invoice_id: { required: true, pattern: "INV-[0-9]{4}" }
