@@ -3,27 +3,32 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Lint, type-check, test (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    name: Lint, types, tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         python: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
           cache: pip
       - name: Install
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,llm]"
       - name: Ruff lint
         run: ruff check .
       - name: Ruff format
@@ -34,25 +39,54 @@ jobs:
         run: aggw validate-policy policies/support-agent.yaml
       - name: Tests with coverage
         run: pytest --cov=guardrails_gateway --cov-report=term-missing --cov-fail-under=85
+      - name: Attack-scenario evaluation
+        run: aggw eval --markdown eval-report.md
+      - name: Publish evaluation summary
+        if: always() && matrix.python == '3.12'
+        run: cat eval-report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Offline demo runs end to end
         run: aggw demo
 
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e ".[llm]" pip-audit
+      - name: pip-audit (known vulnerabilities in installed dependencies)
+        run: pip-audit --skip-editable
+
   docker:
     name: Container builds and serves
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build image
         run: docker build -t agent-guardrails-gateway:ci .
-      - name: Health check
+      - name: Health check and a live decision
         run: |
           docker run -d --name aggw -p 8080:8080 \
             -e AGGW_GRANT_SECRET=$(openssl rand -hex 32) \
             -e AGGW_ADMIN_TOKEN=ci-admin \
             agent-guardrails-gateway:ci
-          for i in $(seq 1 20); do
-            curl -fsS localhost:8080/healthz && exit 0
+          for i in $(seq 1 30); do
+            curl -fsS localhost:8080/healthz && break
             sleep 1
           done
-          docker logs aggw
-          exit 1
+          GRANT=$(curl -fsS localhost:8080/v1/grants -H "Authorization: Bearer ci-admin" \
+            -H 'content-type: application/json' \
+            -d '{"agent_id":"support-agent","task_id":"CI","tools":["search_docs"],"issued_by":"ci"}' \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['grant'])")
+          OUT=$(curl -fsS localhost:8080/v1/tool-calls -H "X-Agent-Grant: $GRANT" \
+            -H 'content-type: application/json' \
+            -d '{"agent_id":"support-agent","task_id":"CI","session_id":"s","tool":"delete_record","arguments":{"record_id":"x"}}')
+          echo "$OUT"
+          echo "$OUT" | grep -q '"outcome":"deny"'
+      - name: Container logs
+        if: always()
+        run: docker logs aggw || true
