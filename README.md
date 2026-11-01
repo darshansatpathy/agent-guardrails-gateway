@@ -1,8 +1,10 @@
 # Agent Guardrails Gateway
 
 [![CI](https://github.com/darshansatpathy/agent-guardrails-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/darshansatpathy/agent-guardrails-gateway/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/darshansatpathy/agent-guardrails-gateway/actions/workflows/codeql.yml/badge.svg)](https://github.com/darshansatpathy/agent-guardrails-gateway/actions/workflows/codeql.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 ![Typed](https://img.shields.io/badge/mypy-strict-informational)
+![Attacks contained](https://img.shields.io/badge/attack%20scenarios-23%2F23%20contained-success)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 **A policy enforcement point between AI agents and the tools they call.**
@@ -21,6 +23,9 @@ agent  ──tool call──▶  GATEWAY  ──allowed calls only──▶  CRM
                  tamper-evident audit log of every decision
 ```
 
+> Reference implementation built on synthetic data. It distils patterns from production
+> agent platforms into a codebase you can run, read and extend in an afternoon.
+
 ---
 
 ## What it enforces
@@ -36,30 +41,30 @@ agent  ──tool call──▶  GATEWAY  ──allowed calls only──▶  CRM
 | **Tamper-evident audit** | Quietly editing history after an incident | Append-only JSONL, each record HMAC-chained to the previous one. `verify` names the first altered record. |
 | **MCP proxy** | Agents seeing or calling MCP tools outside their remit | Drop-in stdio proxy: filters `tools/list`, enforces every `tools/call`. |
 
+Mapped to the [OWASP Top 10 for LLM Applications](docs/threat-model.md#owasp-top-10-for-llm-applications-2025):
+prompt injection (LLM01), sensitive information disclosure (LLM02), excessive agency
+(LLM06) and unbounded consumption (LLM10).
+
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Agents
-        A1[Support agent]
-        A2[Analytics agent]
-    end
-    O[Orchestrator] -- "issue grant (task, tools, TTL)" --> G
-    A1 -- "tool call + grant" --> G
-    A2 -- "MCP stdio" --> P[aggw mcp-proxy] --> G
+flowchart TB
+    O[Orchestrator] -- "1. grant: task, tools, TTL" --> G
+    A[LLM agent] -- "tool call + grant" --> G
+    M[MCP client] -- stdio --> P[aggw mcp-proxy] --> G
 
     subgraph G[Agent Guardrails Gateway]
         direction TB
-        V1[1. Verify grant] --> V2[2. Policy: agent may use tool?]
-        V2 --> V3[3. Argument constraints]
-        V3 --> V4[4. Rate limit]
-        V4 --> V5{5. Human gate}
+        V1[Verify grant] --> V2[Policy: may this agent use this tool?]
+        V2 --> V3[Argument constraints]
+        V3 --> V4[Rate limit]
+        V4 --> V5{Human gate}
     end
 
-    V5 -- allow --> T[(Tool registry / MCP server)]
+    V5 -- allow --> T[(Tools / MCP server)]
     V5 -- needs approval --> Q[Approval queue]
-    R[Reviewer] -- approve / deny --> Q
-    G -. every decision .-> L[(Hash-chained audit log)]
+    R[Reviewer] -- approve or deny --> Q
+    G -.-> L[(Hash-chained audit log)]
     T -. untrusted output .-> TT[Taint tracker] -.-> V5
 ```
 
@@ -73,8 +78,9 @@ full request lifecycle.
 git clone https://github.com/darshansatpathy/agent-guardrails-gateway
 cd agent-guardrails-gateway
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-aggw demo
+pip install -e ".[dev,llm]"
+aggw demo        # scripted walkthrough of every guardrail
+aggw eval        # 23 attack scenarios + benign controls
 ```
 
 The demo runs a support agent through every guardrail. Abridged output:
@@ -94,9 +100,6 @@ The demo runs a support agent through every guardrail. Abridged output:
     result  ALLOW             rule=approval.granted
     why     approved by finance-lead@example.com
 
- 9. Agent reads a web page carrying a prompt injection
-    result  ALLOW             rule=allow
-
 10. Injected exfiltration to an outside address is denied
     result  DENY              rule=policy.argument_violation
 
@@ -109,20 +112,92 @@ The demo runs a support agent through every guardrail. Abridged output:
     verify  ok=False first_bad_seq=7 reason=record contents were modified
 ```
 
+## Evaluation
+
+Guardrails are only as good as the attacks they have been tested against, so the repo
+ships an attack corpus ([evals/scenarios.yaml](evals/scenarios.yaml)) and runs it on
+every push. An attack passes only if the harmful action never executes. Benign scenarios
+pass only if legitimate work is allowed, because a guardrail that blocks everything gets
+switched off.
+
+**Attacks contained: 23/23** · **Legitimate actions allowed: 6/6**
+
+| Category | Kind | Passed |
+|---|---|---|
+| Approval abuse | attack | 4/4 |
+| Argument abuse | attack | 6/6 |
+| Audit integrity | attack | 1/1 |
+| Credential abuse | attack | 4/4 |
+| Excessive agency | attack | 3/3 |
+| Prompt injection | attack | 4/4 |
+| Resource abuse | attack | 1/1 |
+| Legitimate work | benign | 6/6 |
+
+The eval is tested too: the suite includes tests that weaken the policy (raise the refund
+limit, loosen the recipient pattern, drop taint marking, over-block a safe tool) and
+assert the eval catches each regression. CI publishes the table to the run summary and
+fails if any scenario fails.
+
 ## Use it
+
+### With an LLM agent
+
+The agent loop hands every tool call the model proposes to the gateway and feeds the
+verdict back as the tool's result. Tool schemas shown to the model are generated from the
+policy, so the model only learns about tools it may use, with their limits described.
+
+```bash
+export AGGW_LLM_BASE_URL=https://api.openai.com/v1   # or Azure, vLLM, Ollama, LiteLLM
+export AGGW_LLM_MODEL=gpt-4o-mini
+export AGGW_LLM_API_KEY=...
+aggw agent "Customer acme@example.com was double charged on INV-1001. Sort it out."
+```
+
+Illustrative output. The model's wording and the order of its calls will vary; the
+gateway's verdicts for a given call will not.
+
+```text
+ALLOW             read_invoice    rule=allow  all checks passed
+REQUIRE_APPROVAL  refund_payment  rule=human_gate  'refund_payment' is high risk
+ALLOW             send_email      rule=allow  all checks passed
+
+I've confirmed the duplicate charge and requested a $120 refund, which is waiting for
+finance approval. I've emailed the customer to let them know.
+```
+
+For Azure OpenAI, set `AGGW_LLM_BASE_URL` to the deployment URL and
+`AGGW_AZURE_API_VERSION`. Anything with a Chat Completions-compatible endpoint works,
+which is how Bedrock, Vertex and other hosted models are commonly fronted.
+
+```python
+from guardrails_gateway.agent import GuardedAgent
+from guardrails_gateway.config import Settings, build_gateway
+from guardrails_gateway.providers import OpenAICompatibleProvider
+
+gateway = build_gateway(Settings.from_env())
+grant = gateway.issue_grant(
+    "support-agent",
+    "T-42",
+    ["read_invoice", "send_email"],
+    ttl_seconds=900,
+    issued_by="orchestrator",
+)
+run = GuardedAgent(
+    gateway, OpenAICompatibleProvider.from_env(), "support-agent", "T-42", grant
+).run("Has INV-1001 been paid?")
+```
 
 ### As an HTTP service
 
 ```bash
-export AGGW_GRANT_SECRET=$(openssl rand -hex 32)
-export AGGW_AUDIT_KEY=$(openssl rand -hex 32)
-export AGGW_ADMIN_TOKEN=change-me
-aggw serve --port 8080          # OpenAPI docs at http://localhost:8080/docs
+cp .env.example .env    # set real secrets: openssl rand -hex 32
+docker compose up --build
+# or: aggw serve --port 8080    (OpenAPI docs at http://localhost:8080/docs)
 ```
 
 ```bash
 # Orchestrator: grant the agent two tools for one task, for 15 minutes
-GRANT=$(curl -s localhost:8080/v1/grants -H "Authorization: Bearer change-me" \
+GRANT=$(curl -s localhost:8080/v1/grants -H "Authorization: Bearer $AGGW_ADMIN_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"agent_id":"support-agent","task_id":"T-42","tools":["search_docs","refund_payment"],
        "ttl_seconds":900,"issued_by":"orchestrator"}' | jq -r .grant)
@@ -136,7 +211,7 @@ curl -s localhost:8080/v1/tool-calls -H "X-Agent-Grant: $GRANT" \
 
 # Reviewer approves; the agent retries the identical call and it runs once.
 curl -s -X POST localhost:8080/v1/approvals/apr_.../approve \
-  -H "Authorization: Bearer change-me" -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AGGW_ADMIN_TOKEN" -H 'content-type: application/json' \
   -d '{"decided_by":"finance-lead@example.com","note":"duplicate charge"}'
 ```
 
@@ -149,6 +224,9 @@ curl -s -X POST localhost:8080/v1/approvals/apr_.../approve \
 | `GET /v1/audit/verify` | auditors (admin) | check the chain |
 | `GET /metrics` | monitoring | Prometheus counters by outcome and rule |
 
+The container runs as a non-root user with a read-only filesystem, no Linux
+capabilities and `no-new-privileges` in the compose file.
+
 ### In front of any MCP server
 
 ```bash
@@ -159,30 +237,6 @@ aggw mcp-proxy --agent support-agent --task T-42 -- npx -y @modelcontextprotocol
 Point your MCP client at the proxy command instead of the server. The agent only sees the
 tools its policy and grant allow, and blocked calls come back as MCP tool errors the model
 can read. A client config example is in [examples/mcp-client-config.json](examples/mcp-client-config.json).
-
-### As a library
-
-```python
-from guardrails_gateway.config import Settings, build_gateway
-from guardrails_gateway.models import ToolCall
-
-gateway = build_gateway(Settings.from_env())
-grant_token = gateway.issue_grant(
-    "support-agent", "T-42", ["send_email"], ttl_seconds=900, issued_by="orchestrator"
-)
-decision = gateway.evaluate(
-    ToolCall(
-        agent_id="support-agent",
-        task_id="T-42",
-        session_id="s1",
-        tool="send_email",
-        arguments={"to": "a@example.com", "subject": "Hi"},
-    ),
-    grant_token,
-)
-if decision.allowed:
-    ...
-```
 
 ## Policy
 
@@ -211,8 +265,20 @@ agents:
       # delete_record is absent: this agent can never delete anything.
 ```
 
-`aggw validate-policy <file>` lints a policy in CI before it ships. Typos in keys,
-undefined tools and invalid regexes fail validation instead of failing open at runtime.
+`aggw validate-policy <file>` lints a policy in CI before it ships, and `aggw eval
+--policy <file>` runs the attack corpus against it. Typos in keys, undefined tools and
+invalid regexes fail validation instead of failing open at runtime.
+
+## Observability
+
+- **Decision logs:** one JSON line per decision on the `aggw.decision` logger, with agent,
+  tool, outcome, rule, redacted arguments, latency and the request ID.
+- **Request IDs:** `X-Request-ID` is accepted from your edge or generated, and returned on
+  every response.
+- **Traces:** with `pip install "agent-guardrails-gateway[otel]"` and an OpenTelemetry
+  SDK configured, each evaluation is an `aggw.evaluate` span nested under the agent's own
+  span, so a trace shows exactly which step a guardrail stopped.
+- **Metrics:** `/metrics` exposes Prometheus counters by outcome and by rule.
 
 ## Design decisions
 
@@ -223,18 +289,23 @@ Each is recorded as an ADR with the alternatives considered:
 - [ADR-0003](docs/adr/0003-approvals-bound-to-call-fingerprint.md) Approvals bound to the exact call, single use
 - [ADR-0004](docs/adr/0004-taint-tracking-over-injection-detection.md) Contain prompt injection with taint tracking instead of detecting it
 - [ADR-0005](docs/adr/0005-hash-chained-audit-log.md) Keyed hash chain for the audit log
+- [ADR-0006](docs/adr/0006-attack-corpus-in-ci.md) Test guardrails against an attack corpus in CI
+- [ADR-0007](docs/adr/0007-provider-agnostic-agent-loop.md) Provider-agnostic agent loop with schemas from policy
 
 The threat model, including what this gateway deliberately does *not* defend against, is
 in [docs/threat-model.md](docs/threat-model.md).
 
 ## Quality bar
 
-- **84 tests**, including an end-to-end test that runs the real MCP proxy process in
-  front of a stub MCP server over stdio
-- `mypy --strict`, `ruff` lint and format, all enforced in CI on Python 3.11 to 3.13
-- CI also runs the offline demo and builds and health-checks the container
-- Non-root, multi-stage Docker image with a health check
-- Sensitive argument values (keys, tokens, card numbers) are redacted before logging
+| Check | Where it runs |
+|---|---|
+| 111 tests (unit, API, agent loop, eval regressions, end-to-end MCP proxy over stdio), 92% coverage, 85% gate | CI, Python 3.11 to 3.13 |
+| `mypy --strict`, ruff lint and format | CI |
+| Attack-scenario evaluation, published to the run summary | CI |
+| Dependency audit (`pip-audit`) | CI |
+| CodeQL security analysis (`security-extended`) | CI, weekly |
+| Container build, health check and a live deny decision | CI |
+| Dependabot for Python, Actions and the base image | Weekly |
 
 ## Taking it to production
 
@@ -248,25 +319,30 @@ enterprise deployment are deliberate:
 | In-memory taint and rate state | Redis, so multiple gateway replicas share state |
 | YAML policy engine | Same model compiled to OPA/Rego or Cedar if you already run one |
 | Local audit file | Ship to your SIEM; anchor the chain head in WORM storage daily |
-| `/metrics` counters | OpenTelemetry traces per decision, linked to the agent's trace |
+| Env-var secrets | Secret manager with rotation (Key Vault, Secrets Manager, Secret Manager) |
 
 ## Project layout
 
 ```
 src/guardrails_gateway/
-  gateway.py     the five-step decision pipeline and tool execution
-  policy.py      YAML policy model and argument constraints
-  grants.py      task-scoped signed grants, revocation
-  approvals.py   human approval queue (SQLite)
-  audit.py       hash-chained audit log and verification
-  taint.py       untrusted-content tracking per session
-  ratelimit.py   sliding-window limits
-  mcp_proxy.py   stdio proxy for MCP servers
-  api.py         FastAPI service
-  cli.py         aggw serve | demo | verify-audit | validate-policy | mcp-proxy
-policies/        example policies
-docs/            architecture, threat model, ADRs
-tests/           unit, API and end-to-end tests
+  gateway.py        the five-step decision pipeline and tool execution
+  policy.py         YAML policy model and argument constraints
+  grants.py         task-scoped signed grants, revocation
+  approvals.py      human approval queue (SQLite)
+  audit.py          hash-chained audit log and verification
+  taint.py          untrusted-content tracking per session
+  ratelimit.py      sliding-window limits
+  agent.py          agent loop that routes every tool call through the gateway
+  providers.py      model providers: OpenAI-compatible, Azure OpenAI, scripted mock
+  evals.py          attack-scenario evaluation
+  observability.py  JSON logs, request IDs, OpenTelemetry spans
+  mcp_proxy.py      stdio proxy for MCP servers
+  api.py            FastAPI service
+  cli.py            aggw serve | demo | eval | agent | verify-audit | validate-policy | mcp-proxy
+policies/           example policies
+evals/              attack and benign scenarios
+docs/               architecture, threat model, ADRs
+tests/              unit, API, eval and end-to-end tests
 ```
 
 ## About
@@ -274,4 +350,4 @@ tests/           unit, API and end-to-end tests
 Built by **Darshan Kumar Satpathy**, Solutions Architect for Data & AI.
 [Portfolio](https://darshansatpathy.github.io) · [LinkedIn](https://www.linkedin.com/in/darshansatpathy/)
 
-MIT licensed. Issues and pull requests are welcome.
+MIT licensed. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).

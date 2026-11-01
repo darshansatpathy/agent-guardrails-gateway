@@ -41,3 +41,15 @@
   key rotation and host hardening.
 - **Authorisation inside the downstream system.** The gateway is an additional layer;
   tools should still enforce their own access control.
+
+## OWASP Top 10 for LLM Applications (2025)
+
+How the gateway's controls map to the risks it addresses. Risks that live in the model,
+the training pipeline or the application's own output handling are out of scope here.
+
+| OWASP risk | Gateway controls | Eval coverage |
+|---|---|---|
+| **LLM01 Prompt injection** | Taint tracking gates egress after untrusted reads; argument constraints block injected recipients and payloads | ATK-01 to ATK-04, ATK-13 |
+| **LLM02 Sensitive information disclosure** | Egress gating, recipient allow-patterns, redaction of secrets in audit and logs | ATK-01, ATK-12, observability tests |
+| **LLM06 Excessive agency** | Task-scoped grants, default-deny policy, human approval for high-risk and irreversible tools, self-approval blocked | ATK-05 to ATK-07, ATK-14 to ATK-17 |
+| **LLM10 Unbounded consumption** | Per-agent, per-tool rate limits; grant TTLs; task kill switch | ATK-20 to ATK-22 |
